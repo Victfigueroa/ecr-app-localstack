@@ -1,0 +1,106 @@
+name: Construir Imagen en DockerHub
+
+on:
+    push:
+        branches: ["main"]
+
+jobs:
+    job-dockerhub:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout del repo
+              uses: actions/checkout@v4
+
+            - name: Iniciar sesión en Docker Hub
+              uses: docker/login-action@v3
+              with:
+                username: ${{ secrets.DOCKERHUB_USERNAME }}
+                password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            - name: Construir y publicar
+              uses: docker/build-push-action@v6
+              with:
+                context: .
+                push: true
+                tags: ${{ secrets.DOCKERHUB_USERNAME }}/app-localstack:latest
+
+    build-push-and-deploy:
+        needs: job-dockerhub
+        runs-on: ubuntu-latest
+
+        services:
+            localstack:
+                image: localstack/localstack-pro:latest
+                env:
+                    LOCALSTACK_API_KEY: ${{ secrets.LOCALSTACK_API_KEY }}
+                    SERVICES: ecr
+                    DEFAULT_REGION: us-east-1
+                ports:
+                    - 4566:4566
+
+        steps:
+            - name: Checkout del repo
+              uses: actions/checkout@v4
+
+            - name: Instalar las herramientas
+              run: |
+                pip install awscli-local
+                sudo apt-get update && sudo apt-get install -y jq
+                curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64 && chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+                curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+            - name: Esperar a que LocalStack instale
+              run: |
+                for i in {1..2}; do if curl -s http://localhost:4566/_localstack/health | jq -e '.services.ecr == "running"'; then echo "ECR está listo!", break; fi; echo "Esperanding..."; sleep 8; done
+
+            - name: Crear repositorio ECR y obtener URI
+              id: ecr_repo
+              run: |
+                REPO_JSON=$(awslocal ecr create-repository --repository-name repo-pipe-ecr --image-scanning-configuration scanOnPush=true)
+
+                URI=$(echo $REPO_JSON | jq -r '.repositories[0].repositoryUri // .repository.repositoryUri')
+                echo "uri=$URI" >> $GITHUB_OUTPUT
+
+
+            - name: Construir la imagen al ECR LocalStack
+              id: build_image
+              run: |
+                ECR_REPO_URI="${{ steps.ecr_repo.outputs.uri }}"
+                IMAGE_TAG="${{ github.sha }}"
+
+                FULL_IMAGE_NAME="$ECR_REPO_URI:$IMAGE_TAG"
+                SIMPLE_KIND_NAME="app-localstack:latest"
+
+                docker build -t "$FULL_IMAGE_NAME" -t "$SIMPLE_KIND_NAME" .
+                echo "kind_image_name=$SIMPLE_KIND_NAME" >> $GITHUB_OUTPUT
+
+                docker push "$FULL_IMAGE_NAME"
+
+            - name: Crear clúster de Kind
+              run: kind create cluster
+
+            - name: Cargar la imagen a los nodos
+              run: kind load docker-image ${{ steps.build_image.outputs.kind_image_name }}
+
+            - name: Desplegar la app en Kind
+              id: deploy
+              run: |
+                kubectl apply -f k8s/
+                kubectl set image deployment/app-localstack-deployment app-localstack-container=${{ steps.build_image.outputs.kind_image_name }}
+                kubectl rollout status deployment/app-localstack-deployment --timeout=3m
+              continue-on-error: true
+
+            - name: Diagnóstico
+              if: steps.deploy.outcome == 'failure'
+              run: |
+                kubectl describe desployment app-localstack
+                kubectl describe pds -l app=app-localstack
+            
+            - name: Verificar
+              if: steps.deploy.outcome == 'success'
+              run: |
+                kubectl get pods
+
+
+              
+        

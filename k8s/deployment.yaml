@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-localstack-deployment
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: app-localstack
+  template:
+    metadata:
+      labels:
+        app: app-localstack
+    spec:
+      containers:
+      - name: app-localstack-container
+        imagePullPolicy: IfNotPresent
+        image: app-localstack:latest
+        ports:
+        - containerPort: 8080
+
