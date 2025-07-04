@@ -20,7 +20,7 @@ jobs:
             - name: Construir y publicar
               uses: docker/build-push-action@v6
               with:
-                context: .
+                context: ./app
                 push: true
                 tags: ${{ secrets.DOCKERHUB_USERNAME }}/app-localstack:latest
 
